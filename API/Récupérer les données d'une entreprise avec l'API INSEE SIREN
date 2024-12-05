@@ -1,0 +1,161 @@
+<?php
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+function fetchApiToken(): ?string
+{
+    $urlToken = 'https://api.insee.fr/token';
+    $clientKey = env('INSEE_CONSUMER_KEY');
+    $clientSecret = env('INSEE_CONSUMER_SECRET');
+    $credentials = base64_encode("$clientKey:$clientSecret");
+
+    try {
+        $response = Http::timeout(10)->asForm()->withHeaders([
+            'Authorization' => 'Basic ' . $credentials,
+        ])->post($urlToken, [
+            'grant_type' => 'client_credentials',
+            'validity_period' => 86400,
+        ]);
+
+        if ($response->successful()) {
+            return $response->json()['access_token'];
+        } else {
+            Log::error('Erreur lors de la récupération du token INSEE', [
+                'status_code' => $response->status(),
+                'response_body' => $response->body(),
+            ]);
+            return null;
+        }
+    } catch (\Exception $e) {
+        Log::error('Exception dans fetchApiToken', [
+            'message' => $e->getMessage(),
+            'stack' => $e->getTraceAsString(),
+        ]);
+        return null;
+    }
+}
+
+function fetchFirmData($siret, $token): ?array
+{
+    $url = "https://api.insee.fr/entreprises/sirene/V3.11/siret/$siret";
+
+    try {
+        $response = Http::timeout(10)->withHeaders([
+            'Accept' => 'application/json',
+            'Authorization' => 'Bearer ' . $token,
+        ])->get($url);
+
+        if ($response->successful()) {
+            return $response->json();
+        } else {
+            Log::error('Erreur lors de la récupération des données INSEE', [
+                'status_code' => $response->status(),
+                'response_body' => $response->body(),
+                'siret' => $siret,
+            ]);
+            return null;
+        }
+    } catch (\Exception $e) {
+        Log::error('Exception dans fetchFirmData', [
+            'message' => $e->getMessage(),
+            'stack' => $e->getTraceAsString(),
+            'siret' => $siret,
+        ]);
+        return null;
+    }
+}
+
+function parseFirmData($data): array
+{
+    $result = [
+        'firm_name' => '',
+        'firm_commercial_name' => '',
+        'firm_type' => '',
+        'firm_workforce' => '',
+        'firm_address_1' => '',
+        'firm_address_2' => '',
+        'firm_cp' => '',
+        'firm_town' => '',
+    ];
+
+    if (!isset($data['etablissement']) || !isset($data['etablissement']['uniteLegale'])) {
+        Log::error('Structure de données INSEE invalide', ['data' => $data]);
+        return $result;
+    }
+
+    $etablissement = $data['etablissement'];
+    $uniteLegale = $etablissement['uniteLegale'];
+
+    $result['firm_name'] = $uniteLegale['nomUsageUniteLegale'] ?? 
+                           $uniteLegale['denominationUniteLegale'] ?? 
+                           $uniteLegale['nomUniteLegale'] ?? '';
+
+    $periodes = $etablissement['periodesEtablissement'] ?? [];
+    $recentPeriode = collect($periodes)->firstWhere('dateFin', null);
+
+    $result['firm_commercial_name'] = $recentPeriode['denominationUsuelleEtablissement'] ?? '';
+    $result['firm_type'] = $uniteLegale['categorieJuridiqueUniteLegale'] ?? '';
+    $result['firm_workforce'] = $etablissement['trancheEffectifsEtablissement'] ?? '';
+
+    $adresse = $etablissement['adresseEtablissement'] ?? [];
+    $result['firm_address_1'] = trim(
+        ($adresse['numeroVoieEtablissement'] ?? '') .
+        ($adresse['typeVoieEtablissement'] ? ' ' . $adresse['typeVoieEtablissement'] : '') .
+        ($adresse['libelleVoieEtablissement'] ? ' ' . $adresse['libelleVoieEtablissement'] : '')
+    );
+    $result['firm_address_2'] = $adresse['complementAdresseEtablissement'] ?? '';
+    $result['firm_cp'] = $adresse['codePostalEtablissement'] ?? '';
+    $result['firm_town'] = $adresse['libelleCommuneEtablissement'] ?? '';
+
+    return $result;
+}
+
+// Principal
+$firmData = [
+    'firm_name' => '',
+    'firm_commercial_name' => '',
+    'firm_type' => '',
+    'firm_workforce' => '',
+    'firm_address_1' => '',
+    'firm_address_2' => '',
+    'firm_cp' => '',
+    'firm_town' => '',
+    'insee_error' => '',
+];
+
+$firmSiret = $payment->firm_siret;
+
+if ($firmSiret) {
+    $token = fetchApiToken();
+
+    if ($token) {
+        $apiData = fetchFirmData($firmSiret, $token);
+
+        if ($apiData) {
+            $firmData = parseFirmData($apiData);
+        } else {
+            $firmData['insee_error'] = "Erreur lors de la récupération des données de l'API INSEE.";
+        }
+    } else {
+        $firmData['insee_error'] = "Erreur d'authentification auprès de l'API INSEE.";
+    }
+}
+
+$data = array_merge([
+    'title' => 'Détails entreprise',
+    'description' => 'Renseignez ici les informations sur votre entreprise.',
+    'heading' => config('app.name'),
+    'canonical' => $canonical,
+    'robot' => $robot,
+    'ogUrl' => $urlPage,
+    'ogImage' => $urlImage,
+    'villes' => $villes,
+    'artisans' => $artisans,
+    'liberaljobs' => $liberaljobs,
+    'commerces' => $commerces,
+    'invoice_slug' => $invoice_slug,
+], $firmData);
+
+// Envoyer les données à la vue
+return view('payment.orderForm_firm', $data);
